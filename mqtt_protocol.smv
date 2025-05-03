@@ -1,0 +1,335 @@
+-- PROGETTO PER LINGUAGGI DI PROGRAMMAZIONE E VERIFICA DEL SOFTWARE, SESSIONE INVERNALE 2024/2025
+-- MQTT basic
+
+-- protocollo MQTT (publish/subscriber con messaggi push)
+-- Topologia: modello con un broker che comunica con un publisher e un subscriber
+-- Ci si concentra sulla parte di comunicazione, in particolare sulla consegna dei messaggi pubblicati in diverse circostanze
+-- (subscriber connesso o no), cercando di modellare QoS 1 e di garantire sessioni persistenti (tramite la memorizzazione da parte
+-- del broker dei messaggi non ricevuti dal subscriber). Il focus è in particolare sulla comunicazione broker-subscriber.
+-- In MQTT, ogni messaggio fa parte di un certo topic. Essendo la modellazione della gestione di più topic non strettamente
+-- necessaria con le proprietà date, si presume che ci sia un singolo topic.
+
+
+--                                              ---------------------
+--        --------------                        |      BROKER       |          --------------
+--        |            |                        |                   |          |            |
+--        | PUBLISHER  |  <----------------->   |                   | <------> | SUBSCRIBER |
+--        |            |                        |                   |          |            |
+--        --------------                        |                   |          --------------
+--                                              ---------------------
+--
+
+
+MODULE main
+
+VAR
+
+b : broker(p,s);                   -- Broker: fa da intermediario nella comunicazione tra i client
+-- I client sono tutti i componenti che si collegano al broker, in particolare differenziamo:
+p : publisher(b);                  -- Publisher: client che si occupa di pubblicare nuovi messaggi
+s : subscriber(b);                 -- Subscriber: client che si possono iscrivere a certi topic, segnalando il loro interesse a
+                                   -- ricevere i messaggi pubblicati in quel topic
+
+-- ________________
+--| MODEL CHECKING |
+--|________________|
+
+-- PROPRIETÀ 1 (raggiungibilità)
+CTLSPEC -- il subscriber prima o poi può ricevere un messaggio
+EF(s.state = pub_ack)   -- risultato: vera
+
+-- PROPRIETÀ 2 (safety)
+CTLSPEC -- non si verifica mai che un client riceva un messaggio mentre non è connesso
+AG!(!s.connected & s.state = pub_ack)   -- risultato: vera
+
+-- PROPRIETÀ 3 (safety)
+CTLSPEC -- non succede mai che un client non iscritto ad un topic ne riceva i messaggi
+AG!((!s.subscribed) & (s.state = pub_ack)) -- risultato: vera
+
+-- PROPRIETÀ 4 (liveness): viene garantito QoS 1? Ovvero, tutti i messaggi pubblicati vengono ricevuti dal subscriber iscritto?
+-- In particolare, se un messaggio viene mandato dal broker mentre il subscriber è disconnesso, può essere ricevuto
+-- se in seguito quello si riconnette?
+CTLSPEC
+AG((s.subscribed & b.state = publish & !s.connected) -> AF(s.connected & AF(s.state = pub_ack)))
+-- risulta falsa, il controesempio dato presenta il caso in cui, dopo che viene pubblicato un messaggio mentre il subscriber
+-- è disconnesso, il subscriber si connette e disconnette subito dopo in un loop infinito, non lasciando quindi il tempo
+-- al broker di consegnargli quel messaggio. Di seguito il loop che veniva mostrato:
+
+--  -- Loop starts here
+--  -> State: 1.12 <-
+--    b.state = conn_ack
+--    b.snd_msg = 1
+--    p.msg = 0
+--    b.msg = 0
+--    p.snd_msg = 0
+--  -> State: 1.13 <-
+--    b.snd_msg = 0
+--    b.signal = 1
+--    s.connected = TRUE
+--  -> State: 1.14 <-
+--    b.signal = 2
+--    s.state = disconnect
+--  -> State: 1.15 <-
+--    b.state = disconn_ack
+--    b.signal = 3
+--  -> State: 1.16 <-
+--    b.signal = 4
+--    s.state = connect
+--    s.connected = FALSE
+--  -> State: 1.17 <-
+--    b.state = publish
+--  -> State: 1.18 <-
+--    b.snd_msg = 1
+--    b.signal = 0
+--  -> State: 1.19 <-
+--    b.state = conn_ack
+
+-- Il problema sta quindi nella brevità delle connessioni instaurate, che durano così poco da non permettere al broker di
+-- consegnare un messaggio. Per risolvere questo, nel modulo SUBSCRIBER si è aggiunta una variabile count_stable, che funge da
+-- contatore della "lunghezza" della connessione (in termini di tempo) tra subscriber e broker, dove il tempo viene misurato facendo
+-- incrementare il contatore ogni volta che lo stato attuale è diverso da connect o disconnect.
+-- Dopo aver fatto in modo che ogni connessione stabilita tra subscriber e broker sia stabile (e che quindi il subscriber rimanga
+-- connesso abbastanza a lungo da poter ricevere un eventuale messaggio), la proprietà risulta vera.
+
+
+
+
+-- PROPRIETÀ 5 (fairness forte) le richieste di connessione da parte del subscriber vengono sempre acknowledged
+LTLSPEC
+(G F(s.state = connect) -> G F(b.state = conn_ack)) -- risultato: vera
+
+
+-- PROPRIETÀ 6 (irraggiungibilità composta): non può mai succedere che il publisher non ha pubblicato niente ma che il broker
+-- riconosca di aver ricevuto un messaggio dal publisher
+LTLSPEC
+G!((p.state != publish) & X(b.state = pub_ack)) -- risultato: vera
+
+
+-- BROKER
+-- Per garantire QoS 1 anche in caso il subscriber sia disconnesso, rendendo quindi vera 4, il broker deve memorizzare
+-- i messaggi non ancora ricevuti dal subscriber, ritrasmettendoli ogni tot di tempo (dove il tempo
+-- è misurato con un contatore). Tuttavia, essendo finito il numero di elementi memorizzabili in un array, questo significa che il
+-- QoS 1, ovvero la consegna di ogni messaggio al subscriber almeno una volta, può essere ottenuto solo sugli elementi salvati nell'array.
+
+
+MODULE broker(pub,sub)
+
+VAR
+
+-- Quando passo a pub_ack mi salvo una copia del messaggio trasmesso e la mantengo finché non ricevo un pub_ack dal subscriber,
+-- che conferma la ricezione del messaggio.
+-- Se passa un tot di tempo (indicato da contatore "signal") senza che il subscriber passi a pub_ack, allora lo ritrasmetto.
+
+state : {idle,          -- nessuno sta richiedendo niente al broker
+        conn_ack,       -- un client si è appena connesso
+        sub_ack,        -- un client si è appena iscritto ad un topic
+        pub_ack,        -- un client ha pubblicato un messaggio
+        publish,        -- il broker manda il messaggio trasmesso dal publisher ai subscriber
+        disconn_ack};   -- un client si è disconnesso
+
+snd_msg : {0,1,2,3,4,5,6,7,8,9,10};      -- messaggio da trasmettere al subscriber
+
+not_received : array 0..2 of {0,1,2,3,4,5,6,7,8,9,10};    -- array che contiene i messaggi non ancora consegnati al subscriber 
+                                        -- 0 indica l'assenza del messaggio
+
+size : 0..3;                            -- numero di messaggi non consegnati
+
+signal : 0..4;                          -- contatore del tempo (misurato in cambi di stato) passato dall'ultima trasmissione
+                                        -- di un messaggio: raggiunto il massimo, se c'è un messaggio non ancora ricevuto
+                                        -- in not_received, signal fa scattare il passaggio allo stato publish del broker
+
+DEFINE msg := pub.snd_msg;              -- messaggio ricevuto dal publisher
+
+ASSIGN
+
+init(state) := idle;
+init(snd_msg) := 0;
+init(not_received[0]) := 0;
+init(not_received[1]) := 0;
+init(not_received[2]) := 0;
+init(size) := 0;
+init(signal) := 0;
+
+next(state) :=
+case
+    (signal < 4 & state = pub_ack) : publish;
+    (signal < 4 & sub.state = connect) : conn_ack;
+    (signal < 4 & sub.state = subscribe) : sub_ack;
+    (signal < 4 & pub.state = publish) : pub_ack;
+    (signal < 4 & sub.state = disconnect) : disconn_ack;
+    (signal = 4) : publish;     -- Se passa un tot di tempo (indicato da contatore "signal") senza che
+                                -- il subscriber passi a pub_ack, allora ritrasmetto il messaggio.
+
+    TRUE : idle;
+esac;
+
+next(snd_msg) :=
+case
+    (state != publish) : 0;
+    (state = publish & size = 1) : not_received[0];
+    (state = publish & size = 2) : not_received[1];
+    (state = publish & size = 3) : not_received[2];
+    TRUE : 0;
+esac;
+
+-- Quando passo a pub_ack mi salvo una copia del messaggio trasmesso e la mantengo finché non ricevo un pub_ack dal subscriber,
+-- che conferma la ricezione del messaggio.
+
+next(size) :=
+case
+    (state = pub_ack & size < 3) : size + 1;       -- si aggiunge nuovo messaggio non consegnato al subscriber
+    (state = pub_ack) : size;
+    (sub.state = pub_ack & size > 0) : size - 1;   -- si toglie un messaggio già consegnato
+    (sub.state = pub_ack) : size;
+    TRUE : size;
+esac;
+
+next(signal) :=
+case
+    (state = publish | size = 0) : 0;  -- resetto il contatore se non c'è niente da trasmettere o ho appena trasmesso qcs
+    (size > 0 & state != publish & state != pub_ack & signal < 4) : signal + 1; -- se c'è un messaggio da mandare e non sto
+                                                                                -- ricevendo né mandando niente, allora
+                                                                                -- incremento il contatore
+    TRUE : signal;
+esac;
+
+next(not_received[0]) :=
+case
+    -- se sono in stato pub_ack vuol dire che ho appena ricevuto un messaggio dal publisher, quindi cerco di salvarlo
+    (state = pub_ack & size = 0) : msg;
+    (state = pub_ack & size = 1) : not_received[0];
+    (state = pub_ack & size = 2) : not_received[0];
+    (state = pub_ack & size >= 3) : not_received[0];    -- se non c'è più posto libero per salvare il messaggio, non lo memorizzo
+    -- se subscriber è in stato pub_ack, ha appena letto un messaggio, quindi lo rimuovo
+    -- (sub.state = pub_ack & size = 0) non ha senso, se non c'è un messaggio da pubblicare, sub non passerebbe a pub_ack
+    (sub.state = pub_ack & size = 1) : 0; -- il messaggio è stato consegnato, non ho più bisogno di memorizzarlo
+    TRUE : not_received[0];
+esac;
+
+next(not_received[1]) :=
+case
+    (state = pub_ack & size = 0) : not_received[0];
+    (state = pub_ack & size = 1) : msg;
+    (state = pub_ack & size = 2) : not_received[0];
+    (state = pub_ack & size >= 3) : not_received[0];
+    (sub.state = pub_ack & size = 2) : 0;
+    TRUE : not_received[1];
+esac;
+
+next(not_received[2]) :=
+case
+    (state = pub_ack & size = 0) : not_received[0];
+    (state = pub_ack & size = 1) : not_received[0];
+    (state = pub_ack & size = 2) : msg;
+    (state = pub_ack & size >= 3) : not_received[0];
+    (sub.state = pub_ack & size = 3) : 0;
+    TRUE : not_received[2];
+esac;
+
+
+-- SUBSCRIBER
+
+MODULE subscriber(br)                       -- legge state e snd_msg dal broker
+
+VAR
+
+state : {idle,
+        connect,                            -- il client si connette al broker
+        subscribe,                          -- il client si iscrive ad un topic
+        pub_ack,                            -- il client sta ricevendo un messaggio dal broker
+        disconnect};                        -- il client si disconnette dal broker (es. problemi di rete)
+connected : boolean;                        -- variabile che indica se il client è connesso al broker
+subscribed : boolean;                       -- variabile che indica se il client è iscritto al topic
+rcv_msg : 0..10;                            -- messaggio ricevuto perché ci si è iscritti al topic
+count_stable : 0..10;                       -- contatore che misura il tempo dal momento che si è instaurata una connessione;
+                                            -- le connessioni sono stabili nel senso che hanno una durata minima di 4 prima di
+                                            -- disconnettersi
+
+ASSIGN
+
+init(connected) := FALSE;
+init(subscribed) := FALSE;
+init(rcv_msg) := 0;
+init(count_stable) := 0;
+init(state) := idle;
+
+next(rcv_msg) :=
+case
+    (state = pub_ack) : br.snd_msg; -- leggo il messaggio pubblicato
+    TRUE : 0;
+esac;
+
+next(state) :=
+case
+    (state = idle & !connected) : connect;
+    (state = idle & !subscribed) : subscribe;
+    (state = idle & br.state = publish) : pub_ack;
+    (count_stable = 4 & state = idle) : {idle, disconnect};
+    (state = connect & connected & !subscribed) : subscribe; -- per poter uscire dallo stato connect, il broker deve avermi
+                                                             -- risposto (ack)
+    (state = connect & connected & br.state = publish) : pub_ack;
+    (count_stable = 4 & state = connect & connected) : {idle, disconnect}; -- se la durata minima di connessione (4) è stata
+                                                                           -- rispettata, ti puoi potenzialmente disconnettere..
+    (state = connect & connected) : idle;                                  -- altrimenti no
+    (state = subscribe & subscribed & br.state = publish) : pub_ack;
+    (count_stable = 4 & state = subscribe & subscribed) : {idle, disconnect};
+    (state = subscribe & subscribed) : idle;
+    (count_stable = 4 & state = pub_ack) : {idle, disconnect};
+    (state = pub_ack) : idle;
+    (state = disconnect & br.state = disconn_ack) : {idle, connect};
+    TRUE : state;
+esac;
+
+next(connected) :=
+case
+    (br.state = conn_ack) : TRUE;
+    (br.state = disconn_ack) : FALSE;
+    TRUE : connected;
+esac;
+
+next(subscribed) :=
+case
+    (br.state = sub_ack) : TRUE;
+    TRUE : subscribed;
+esac;
+
+next(count_stable) :=
+case
+    (state = connect & connected) : 0; -- inizia a contare dal momento della connessione
+    (state = disconnect) : 0;          -- reset quando si è disconnesso
+    (count_stable < 4 & state != connect) : count_stable + 1;
+    TRUE : count_stable;
+esac;
+
+
+
+-- PUBLISHER
+-- si assume che il publisher sia sempre connesso al broker
+
+MODULE publisher(br)    -- client che si connette al broker e da lì in avanti può pubblicare messaggi
+
+VAR
+
+state : {idle, publish};            -- publish = il client pubblica un messaggio (ovvero lo manda al broker)
+msg : 0..10;                        -- contenuto del messaggio pubblicato
+
+DEFINE snd_msg := msg;              -- messaggio da mandare al broker (messaggio da pubblicare)
+
+ASSIGN
+
+init(msg) := 0;                     -- 0 indica che il contenuto del messaggio è vuoto
+init(state) := idle;
+
+next(msg) :=
+case
+    (state = publish) : {1..10};    -- se publisher è nello stato in cui vuole pubblicare un messaggio,
+                                    -- viene creato nondeterministicamente il contenuto di questo nuovo messaggio
+    TRUE : 0;                       -- altrimenti il contenuto è vuoto, a indicare che non si sta pubblicando alcun messaggio
+esac;
+
+next(state) :=
+case
+    (state = idle) : {idle, publish};
+    (state = publish & br.state = pub_ack): idle;
+    TRUE : state;
+esac;
